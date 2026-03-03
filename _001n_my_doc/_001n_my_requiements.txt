@@ -1,0 +1,12 @@
+
+conda create --prefix ./_015n_Fly_CL python=3.9.25
+
+# CUDA 11.7
+pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117
+
+pip install "numpy<2.0.0"
+pip install timm==0.9.16
+pip install tqdm
+pip install scipy
+
+pip install httpx[socks]
