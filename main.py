@@ -47,10 +47,13 @@ def get_parser() -> argparse.ArgumentParser:
     
     return parser
 
-
+# ( G + λI ) Wo = Q
+# 选合适的 λ
 def select_ridge_parameter(Features, Y, ridge_lower, ridge_upper):
     X = Features
+
     U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    
     S_sq = S**2
     UTY = U.T @ Y
     ridges = torch.tensor(10.0 ** np.arange(ridge_lower, ridge_upper))
@@ -145,7 +148,7 @@ if __name__ == "__main__":
         ## 函数内部用 SVD 分解当前任务数据，然后遍历候选 λ 计算 GCV 分数 （论文公式8-11）
         ## 相比传统交叉验证的 O( l m^3 ) 复杂度，GCV 将复杂度将至 O( n^2 m )
         ## 注意一个细节：这里只对当前任务的数据做 SVD 来选 λ ，
-        ## 但求解时用的是累积的 G 和 Q，这保证了效率。
+        ## 但之后求解 Wo 分类器时用的是累积的 G 和 Q，这保证了效率。
         ridge = select_ridge_parameter(train_embeddings.T, Y, args.ridge_lower, args.ridge_upper)
         # ===
 
