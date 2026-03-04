@@ -9,7 +9,7 @@ def load_model(model_name):
         return timm.create_model(
             "vit_base_patch16_224",
             pretrained=True,
-            num_classes=0
+            num_classes=0 # 去掉最后的分类头，只保留特征提取部分
         )
     
     elif model_name == "resnet-50":

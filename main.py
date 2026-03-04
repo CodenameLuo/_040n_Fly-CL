@@ -24,15 +24,23 @@ def get_parser() -> argparse.ArgumentParser:
 
     # model Architecture
     parser.add_argument('--model_name', type=str, default="vit_base_patch16_224", help='model name')
+    ## 预训练模型输出维度 d
     parser.add_argument('--embedding_dim', type=int, default=768, help='Embedding dimension of pre-trained model')
+    ## 扩展维度 m
     parser.add_argument('--expand_dim', type=int, default=10000, help='Expansion dimension of FlyModel')
+    ## 每行非零连接数 p
     parser.add_argument('--synaptic_degree', type=int, default=100, help='Number of connections')
+    ## Top-k 的比例，k = m * coding_level
     parser.add_argument('--coding_level', type=float, default=0.01, help='Top-k number')
 
     # Training Configuration
     parser.add_argument('--seed', type=int, default=2025, help='Random seed')
+    
+    ## === 岭回归正则化系数的搜索范围（log10 尺度）
     parser.add_argument('--ridge_lower', type=float, default=4, help='lower bound for ridge coefficient (log10)')
     parser.add_argument('--ridge_upper', type=float, default=10, help='lower bound for ridge coefficient (log10)')
+    ## ===
+    
     parser.add_argument('--data_augmentation', default=None, help='choose which normalization or not')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--gpu', type=int, default=0, help='Choose gpu')
@@ -79,11 +87,18 @@ if __name__ == "__main__":
     pretrained_model.to(device)
     
     non_zero_per_col = args.synaptic_degree
+
+    # === 稀疏随机投影矩阵构建
+    ## 对应论文4.1中的投影矩阵 W (m*d)
+    ## W 每一行恰好有 p 个非零元素，从 N(0,1) 中采样
+    ## 模拟果蝇嗅觉回路中 PN -> KC 的稀疏连接（每个 KC 只连接固定数量的 PN）
+    ## 转为 CSC 稀疏格式是为了加速矩阵乘法，将复杂度从 O(mnd) 降到 O(mnp)
     projection_matrix = torch.zeros(args.expand_dim, args.embedding_dim)
     for row in range(args.expand_dim):
         selected_cols = torch.randperm(args.embedding_dim)[:non_zero_per_col]
         projection_matrix[row, selected_cols] = torch.randn(non_zero_per_col)
     projection_matrix = projection_matrix.to(device).to_sparse_csc()
+    # ===
 
     acc = {}
     training_time = []
@@ -91,39 +106,91 @@ if __name__ == "__main__":
     Q = torch.zeros(args.expand_dim, args.num_classes).to(device)
     G = torch.zeros(args.expand_dim, args.expand_dim).to(device)
     last_ridge = None
+
     print("Start Continual Learning")
     for task in range(args.num_tasks):
         acc[task] = []
+
         training_start = time.time()
         feature_extract_start = time.time()
+
+        # === 1. 特征提取
+        ## 用冻结的预训练模型提取 d 维特征
         train_embeddings, train_labels = feature_extract(pretrained_model, train_loader[task], device)
+        # ===
+
         feature_extract_end = time.time()
         feature_extract_time.append(feature_extract_end - feature_extract_start)
 
+        # === 2. 稀疏投影 + Top-k
+        ## 对应论文公式(3)(4)
+        ## 先做稀疏矩阵乘法将 d 维投影到 m 维，再保留每个样本最大的 k 个激活值、其余置零
+        ## 这模拟了果蝇 KC 层的“赢者通吃”抑制机制(由 APL 神经元介导)，实现去相关
         train_embeddings = torch.sparse.mm(projection_matrix, train_embeddings.T) # 10000, N
         values, indices = train_embeddings.topk(int(args.expand_dim * args.coding_level), dim=0, largest=True)
         output = torch.zeros_like(train_embeddings)
         output.scatter_(0, indices, values)
         train_embeddings = output
+        # ===
 
+        # === 3. 流式统计量累积
+        ## 对应论文公式(5)
+        ## 这是“流式”的关键——只需累加，不需要存储历史数据，天然适配持续学习
         Y = target2onehot(train_labels, args.num_classes)
         Q = Q + train_embeddings @ Y
         G = G + train_embeddings @ train_embeddings.T
+        # ===
+
+        # === 4. GCV 自适应正则化选择
+        ## 函数内部用 SVD 分解当前任务数据，然后遍历候选 λ 计算 GCV 分数 （论文公式8-11）
+        ## 相比传统交叉验证的 O( l m^3 ) 复杂度，GCV 将复杂度将至 O( n^2 m )
+        ## 注意一个细节：这里只对当前任务的数据做 SVD 来选 λ ，
+        ## 但求解时用的是累积的 G 和 Q，这保证了效率。
         ridge = select_ridge_parameter(train_embeddings.T, Y, args.ridge_lower, args.ridge_upper)
+        # ===
+
+        # === 5. Cholesky 求解
+        ## 对应论文公式(12)
+        ## 利用 G + λI 的正定性做 Cholesky 分解，复杂度从 LU 分解的 O(2/3 m^3) 降到 O(1/3 m^3)
+        ## Wo 就是分类器矩阵 C_t
         L = torch.linalg.cholesky(G + ridge * torch.eye(G.size(dim=0)).to(device)) # 40% faster
         Wo = torch.cholesky_solve(Q, L)
+        # ===
+
         training_end = time.time()
         training_time.append(training_end - training_start)
 
+        # 推理评估
+        ## 对应论文公式(7)和 Algorithm 2
+        ## 对测试样本做同样的投影和 top-k ，然后与分类器矩阵相乘取 argmax。
+        ## 测试特征也转为稀疏格式，将相似度匹配复杂度从 O(mnc) 降到 O(knc)。
         for sub_task in range(task + 1):
+            # === 提取测试样本特征
             test_embeddings, test_labels = feature_extract(pretrained_model, test_loader[sub_task], device)
+            # ===
+
+            # === 测试样本特征 稀疏投影 + Top-k
             test_embeddings = torch.sparse.mm(projection_matrix, test_embeddings.T)
             values, indices = test_embeddings.topk(int(args.expand_dim * args.coding_level), dim=0, largest=True)
             output = torch.zeros_like(test_embeddings)
+            ## scatter_ 将 Top-k 的值放回对应位置，其余保持为0
             output.scatter_(0, indices, values)
+            
+            # === 转置为(N_test, m) 并转为 CSC 稀疏格式
+            ## 因为 top-k 后只有 k 个非零元素，稀疏存储大幅节省内存
+            ## 且后续稀疏矩阵乘法复杂度从 O(m N c) 降到 O(k N c)
             test_embeddings = output.T.to_sparse_csc()
+            # ===
+
+            # === 与分类器矩阵相乘
             output = torch.sparse.mm(test_embeddings, Wo)        
+            # ===
+
+            # === 取 argmax
+            ## topk (k=1) 等价于 argmax，返回每个样本得分最高的类别索引
             predicts = torch.topk(output, k=1, dim=1, largest=True, sorted=True)[1].squeeze()
+            # ===
+
             test_accuracy = np.mean(predicts.cpu().numpy() == test_labels.cpu().numpy()) * 100
             acc[sub_task].append(test_accuracy)
 
